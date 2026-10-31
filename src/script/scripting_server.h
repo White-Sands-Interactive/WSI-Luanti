@@ -36,6 +36,8 @@ public:
 	ServerScripting(Server* server);
 
 	void loadBuiltin();
+	// Server thread, or the main thread after that thread has stopped.
+	lua_State *getLuaState() { return getStack(); }
 	// use ScriptApiBase::loadMod() to load mods
 
 	// Save globals that are copied into other Lua envs

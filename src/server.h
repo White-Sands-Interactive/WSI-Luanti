@@ -18,6 +18,7 @@
 #include "threading/ordered_mutex.h"
 #include "translation.h"
 #include "sound_spec.h"
+#include "wsi/wsi_service.h"
 #include <atomic>
 #include <csignal>
 #include <string>
@@ -319,6 +320,7 @@ public:
 
 	// Envlock and conlock should be locked when using scriptapi
 	inline ServerScripting *getScriptIface() { return m_script.get(); }
+	inline WsiService *getWsi() const { return m_wsi.get(); }
 
 	// actions: time-reversed list
 	// Return value: success/failure
@@ -488,6 +490,7 @@ protected:
 	// Scripting
 	// Envlock and conlock should be locked when using Lua
 	std::unique_ptr<ServerScripting> m_script;
+	std::unique_ptr<WsiService> m_wsi;
 
 	// Mods
 	std::unique_ptr<ServerModManager> m_modmgr;

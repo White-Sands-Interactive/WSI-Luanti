@@ -29,6 +29,7 @@
 #include "lua_api/l_server.h"
 #include "lua_api/l_util.h"
 #include "lua_api/l_vmanip.h"
+#include "lua_api/l_wsi.h"
 #include "lua_api/l_settings.h"
 #include "lua_api/l_http.h"
 #include "lua_api/l_storage.h"
@@ -166,6 +167,7 @@ void ServerScripting::InitializeModApi(lua_State *L, int top)
 	ModApiStorage::Initialize(L, top);
 	ModApiChannels::Initialize(L, top);
 	ModApiIPC::Initialize(L, top);
+	ModApiWsi::Initialize(L, top);
 }
 
 void ServerScripting::InitializeAsync(lua_State *L, int top)

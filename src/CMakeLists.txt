@@ -384,6 +384,20 @@ endif()
 
 check_include_files(endian.h HAVE_ENDIAN_H)
 
+option(ENABLE_WSI "Link the WSI agent player and expose core.wsi_start" FALSE)
+set(USE_WSI FALSE)
+if(ENABLE_WSI)
+	set(WSI_CPP_SOURCE_DIR "" CACHE PATH "Path to the WSI-Cpp source tree")
+	if(NOT EXISTS "${WSI_CPP_SOURCE_DIR}/CMakeLists.txt")
+		message(FATAL_ERROR
+			"ENABLE_WSI is on, but WSI_CPP_SOURCE_DIR is not a WSI-Cpp checkout: ${WSI_CPP_SOURCE_DIR}")
+	endif()
+	set(WSI_EMBEDDED TRUE)
+	add_subdirectory("${WSI_CPP_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/wsi-cpp" EXCLUDE_FROM_ALL)
+	set(USE_WSI TRUE)
+	message(STATUS "WSI agent player enabled.")
+endif()
+
 if((NOT PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR) AND EXISTS "${PROJECT_SOURCE_DIR}/cmake_config.h")
 	message(FATAL_ERROR "You are doing an out-of-tree build, but build artifacts are left in-tree. This will break the build!")
 endif()
@@ -517,6 +531,7 @@ set(common_SRCS
 	remoteplayer.cpp
 	rollback_interface.cpp
 	server.cpp
+	wsi/wsi_service.cpp
 	serverenvironment.cpp
 	servermap.cpp
 	translation.cpp
@@ -539,6 +554,11 @@ endif()
 if(BUILD_UNITTESTS OR BUILD_BENCHMARKS)
 	list(APPEND common_SRCS catch.cpp)
 endif()
+
+set_source_files_properties(wsi/wsi_service.cpp PROPERTIES
+	COMPILE_OPTIONS "-std=c++20"
+	SKIP_PRECOMPILE_HEADERS ON
+)
 
 # This gives us the icon and file version information
 if(WIN32)
@@ -784,6 +804,9 @@ if(BUILD_CLIENT)
 	if (USE_OPENSSL)
 		target_link_libraries(${PROJECT_NAME} OpenSSL::Crypto)
 	endif()
+	if (USE_WSI)
+		target_link_libraries(${PROJECT_NAME} wsi_agent_player)
+	endif()
 	if(BUILD_UNITTESTS OR BUILD_BENCHMARKS)
 		target_link_libraries(${PROJECT_NAME} Catch2::Catch2)
 	endif()
@@ -856,6 +879,9 @@ if(BUILD_SERVER)
 	endif()
 	if (USE_OPENSSL)
 		target_link_libraries(${PROJECT_NAME}server OpenSSL::Crypto)
+	endif()
+	if (USE_WSI)
+		target_link_libraries(${PROJECT_NAME}server wsi_agent_player)
 	endif()
 	if(USE_CURL)
 		target_link_libraries(

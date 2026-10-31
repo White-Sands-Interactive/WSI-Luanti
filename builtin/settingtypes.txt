@@ -1020,6 +1020,10 @@ server_address (Server address) string game.example.net
 #    Homepage of server, to be displayed in the serverlist.
 server_url (Server URL) string https://game.example.net
 
+#    Platform key for WSI agents. When this is empty, secure.wsi_platform_key
+#    and then the WSI_PLATFORM_KEY environment variable are used.
+wsi_platform_key (WSI platform key) string
+
 #    Automatically report to the serverlist.
 server_announce (Announce server) bool false
 

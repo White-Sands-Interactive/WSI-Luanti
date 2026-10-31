@@ -417,6 +417,11 @@ Server::~Server()
 		infostream << "Server: Saving environment metadata" << std::endl;
 		m_env->saveMeta();
 
+		if (m_wsi) {
+			m_wsi->shutdown(m_script ? m_script->getLuaState() : nullptr);
+			m_wsi.reset();
+		}
+
 		// Delete classes that depend on the environment
 		m_inventory_mgr.reset();
 		m_script.reset();
@@ -520,6 +525,7 @@ void Server::init()
 	infostream << "Server: Initializing Lua" << std::endl;
 
 	m_script = std::make_unique<ServerScripting>(this);
+	m_wsi = std::make_unique<WsiService>(this);
 
 	// Must be created before mod loading because we have some inventory creation
 	m_inventory_mgr = std::make_unique<ServerInventoryManager>();
@@ -664,7 +670,16 @@ void Server::AsyncRunStep(float dtime, bool initial_step)
 
 	if (!m_async_fatal_error.get().empty()) {
 		infostream << "Refusing server step in error state" << std::endl;
+		if (m_wsi)
+			m_wsi->failPending("server error");
 		return;
+	}
+
+	// Tool calls from the WSI network thread. This stays ahead of the pause
+	// return so a paused game can still finish an action.
+	if (m_wsi && m_script) {
+		EnvAutoLock lock(this);
+		m_wsi->drainJobs(m_script->getLuaState());
 	}
 
 	{

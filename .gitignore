@@ -70,6 +70,8 @@ AppDir
 /sounds
 /mods/*
 !/mods/mods_here.txt
+!/mods/wsi_npc/
+!/mods/wsi_npc/**
 /worlds/*
 !/worlds/worlds_here.txt
 /clientmods/*

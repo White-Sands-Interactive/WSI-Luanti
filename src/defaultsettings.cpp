@@ -508,6 +508,8 @@ void set_default_settings()
 	settings->setDefault("num_emerge_threads", "0");
 	settings->setDefault("secure.trusted_mods", "");
 	settings->setDefault("secure.http_mods", "");
+	settings->setDefault("secure.wsi_platform_key", "");
+	settings->setDefault("wsi_platform_key", "");
 
 	// Physics
 	settings->setDefault("movement_acceleration_default", "3");

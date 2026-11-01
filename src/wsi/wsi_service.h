@@ -29,6 +29,10 @@ public:
 
 	int startAgent(lua_State *L);
 	void stopAgent(lua_State *L);
+	/// Grant one turn. The session stays up, and nothing is sent until this is called.
+	void requestTurn(lua_State *L);
+	/// Active subgoals for one session. Rejected calls are not included.
+	int pushSubgoals(lua_State *L);
 
 private:
 	struct Impl;

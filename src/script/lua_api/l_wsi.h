@@ -15,6 +15,12 @@ private:
 	// wsi_stop(id)
 	static int l_wsi_stop(lua_State *L);
 
+	// wsi_turn(id) grants one turn to a running agent
+	static int l_wsi_turn(lua_State *L);
+
+	// wsi_subgoals(id) -> {{id, objective, progress}, ...}
+	static int l_wsi_subgoals(lua_State *L);
+
 public:
 	static void Initialize(lua_State *L, int top);
 };

@@ -30,8 +30,31 @@ int ModApiWsi::l_wsi_stop(lua_State *L)
 	return 0;
 }
 
+// wsi_turn(id)
+int ModApiWsi::l_wsi_turn(lua_State *L)
+{
+	NO_MAP_LOCK_REQUIRED;
+	WsiService *wsi = getServer(L)->getWsi();
+	if (!wsi)
+		throw LuaError("WSI agent support is not ready");
+	wsi->requestTurn(L);
+	return 0;
+}
+
+// wsi_subgoals(id) -> list
+int ModApiWsi::l_wsi_subgoals(lua_State *L)
+{
+	NO_MAP_LOCK_REQUIRED;
+	WsiService *wsi = getServer(L)->getWsi();
+	if (!wsi)
+		throw LuaError("WSI agent support is not ready");
+	return wsi->pushSubgoals(L);
+}
+
 void ModApiWsi::Initialize(lua_State *L, int top)
 {
 	API_FCT(wsi_start);
 	API_FCT(wsi_stop);
+	API_FCT(wsi_turn);
+	API_FCT(wsi_subgoals);
 }

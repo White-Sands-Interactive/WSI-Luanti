@@ -384,47 +384,27 @@ endif()
 
 check_include_files(endian.h HAVE_ENDIAN_H)
 
-option(ENABLE_WSI "Link the installed WSI agent player and expose core.wsi_start" FALSE)
+option(ENABLE_WSI "Build the local WSI agent player and expose core.wsi_start" FALSE)
+set(WSI_CPP_SOURCE_DIR "" CACHE PATH "Path to the WSI-Cpp source tree")
 set(USE_WSI FALSE)
 if(ENABLE_WSI)
-	set(_WSI_SEARCH_ROOTS)
-	if(APPLE)
-		foreach(_prefix /opt/homebrew /usr/local)
-			if(EXISTS "${_prefix}/include/wsi/agent_player.hpp")
-				list(APPEND _WSI_SEARCH_ROOTS "${_prefix}")
-			endif()
-		endforeach()
-	endif()
-	find_path(WSI_INCLUDE_DIR NAMES wsi/agent_player.hpp
-		HINTS ${_WSI_SEARCH_ROOTS}
-		PATH_SUFFIXES include)
-	find_library(WSI_LIBRARY NAMES wsi_agent_player
-		HINTS ${_WSI_SEARCH_ROOTS}
-		PATH_SUFFIXES lib)
-	if(_WSI_SEARCH_ROOTS)
-		find_package(nlohmann_json 3.11.3 CONFIG REQUIRED PATHS ${_WSI_SEARCH_ROOTS})
-	else()
-		find_package(nlohmann_json 3.11.3 CONFIG REQUIRED)
-	endif()
-	if(NOT OPENSSL_FOUND)
-		find_package(OpenSSL REQUIRED)
-	endif()
-	if(NOT WSI_INCLUDE_DIR OR NOT WSI_LIBRARY)
+	if(NOT WSI_CPP_SOURCE_DIR)
 		message(FATAL_ERROR
-			"ENABLE_WSI is on, but wsi-agent-player was not found. Install it, or set WSI_INCLUDE_DIR and WSI_LIBRARY.")
+			"ENABLE_WSI is on, but WSI_CPP_SOURCE_DIR is not set. Point it at a WSI-Cpp checkout.")
 	endif()
-	add_library(wsi_agent_player STATIC IMPORTED GLOBAL)
-	set_target_properties(wsi_agent_player PROPERTIES
-		IMPORTED_LOCATION "${WSI_LIBRARY}"
-		INTERFACE_INCLUDE_DIRECTORIES "${WSI_INCLUDE_DIR}")
-	set_property(TARGET wsi_agent_player PROPERTY INTERFACE_LINK_LIBRARIES
-		nlohmann_json::nlohmann_json
-		OpenSSL::SSL
-		OpenSSL::Crypto
-		Threads::Threads
-		${SQLITE3_LIBRARY})
+	if(NOT EXISTS "${WSI_CPP_SOURCE_DIR}/include/wsi/agent_player.hpp")
+		message(FATAL_ERROR
+			"WSI_CPP_SOURCE_DIR (${WSI_CPP_SOURCE_DIR}) does not contain include/wsi/agent_player.hpp.")
+	endif()
+	set(WSI_EMBEDDED ON)
+	set(_wsi_saved_prefix "${CMAKE_PREFIX_PATH}")
+	if(APPLE AND EXISTS "/opt/homebrew")
+		list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
+	endif()
+	add_subdirectory("${WSI_CPP_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/wsi_agent_player" EXCLUDE_FROM_ALL)
+	set(CMAKE_PREFIX_PATH "${_wsi_saved_prefix}")
 	set(USE_WSI TRUE)
-	message(STATUS "WSI agent player: ${WSI_LIBRARY}")
+	message(STATUS "WSI agent player: ${WSI_CPP_SOURCE_DIR}")
 endif()
 
 if((NOT PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR) AND EXISTS "${PROJECT_SOURCE_DIR}/cmake_config.h")

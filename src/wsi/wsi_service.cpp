@@ -73,6 +73,16 @@ int WsiService::startAgent(lua_State *)
 
 void WsiService::stopAgent(lua_State *) {}
 
+void WsiService::requestTurn(lua_State *)
+{
+	throw LuaError("WSI agent support is not built in");
+}
+
+int WsiService::pushSubgoals(lua_State *)
+{
+	throw LuaError("WSI agent support is not built in");
+}
+
 #else
 
 namespace {
@@ -281,6 +291,7 @@ struct WsiService::Impl {
 		std::vector<Action> actions;
 		std::unique_ptr<LuaPlayer> player;
 		wsi::AgentHandle handle;
+		wsi::Subscription events;
 		wsi::AbortSignal abort;
 		std::atomic<bool> stop{false};
 		std::atomic<bool> started{false};
@@ -288,6 +299,14 @@ struct WsiService::Impl {
 		std::atomic<bool> session_ended{false};
 		std::atomic<bool> needs_cleanup{false};
 		std::atomic<bool> cleaned{false};
+		std::atomic<int> turns_due{0};
+		struct Subgoal {
+			std::string id;
+			std::string objective;
+			std::string progress;
+		};
+		std::mutex subgoal_mu;
+		std::vector<Subgoal> subgoals;
 	};
 
 	struct Job {
@@ -333,6 +352,8 @@ struct WsiService::Impl {
 	void shutdown(lua_State *L);
 	int startAgent(lua_State *L);
 	void stopAgent(lua_State *L);
+	void requestTurn(lua_State *L);
+	int pushSubgoals(lua_State *L);
 	wsi::Json callLua(int ref, const wsi::Json &args, const std::vector<wsi::ArgSpec> &specs);
 
 	std::string world_path;
@@ -360,6 +381,7 @@ struct WsiService::Impl {
 	void doStart(Agent *agent);
 	void doTurn(Agent *agent);
 	void doStop(Agent *agent);
+	void rememberSubgoal(Agent *agent, const wsi::AgentEvent &event);
 	void workerMain();
 };
 
@@ -565,7 +587,8 @@ bool WsiService::Impl::hasWork() const
 			return true;
 		if (!agent->started.load() && !agent->start_failed.load())
 			return true;
-		if (agent->started.load() && !agent->session_ended.load())
+		if (agent->started.load() && !agent->session_ended.load() &&
+				agent->turns_due.load() > 0)
 			return true;
 	}
 	return false;
@@ -594,7 +617,9 @@ WsiService::Impl::Work WsiService::Impl::pick(Agent *&out)
 			out = agent;
 			return Work::Start;
 		}
-		if (agent->started.load() && !agent->session_ended.load()) {
+		if (agent->started.load() && !agent->session_ended.load() &&
+				agent->turns_due.load() > 0) {
+			agent->turns_due.fetch_sub(1);
 			cursor = (cursor + i + 1) % count;
 			out = agent;
 			return Work::Turn;
@@ -602,6 +627,45 @@ WsiService::Impl::Work WsiService::Impl::pick(Agent *&out)
 	}
 	return Work::None;
 }
+
+namespace {
+
+std::string jsonField(const wsi::Json &value, const char *key)
+{
+	if (!value.is_object() || !value.contains(key) || value.at(key).is_null())
+		return {};
+	const wsi::Json &item = value.at(key);
+	if (item.is_string())
+		return item.get<std::string>();
+	if (item.is_number_integer())
+		return std::to_string(item.get<long long>());
+	return {};
+}
+
+void noteSubgoal(const std::string &name, const wsi::AgentEvent &event)
+{
+	const std::string action = event.action.value_or("subgoal");
+	const wsi::Json args = event.args.value_or(wsi::Json::object());
+	const std::string id = jsonField(args, "id");
+	std::string detail = jsonField(args, "objective");
+	if (detail.empty())
+		detail = jsonField(args, "progress");
+	if (event.error && !event.error->empty()) {
+		warningstream << "WSI " << name << " subgoal rejected " << action;
+		if (!id.empty())
+			warningstream << " " << id;
+		warningstream << ": " << *event.error << std::endl;
+		return;
+	}
+	actionstream << "WSI " << name << " subgoal " << action;
+	if (!id.empty())
+		actionstream << " " << id;
+	if (!detail.empty())
+		actionstream << ": " << detail;
+	actionstream << std::endl;
+}
+
+}  // namespace
 
 void WsiService::Impl::doStart(Agent *agent)
 {
@@ -615,6 +679,12 @@ void WsiService::Impl::doStart(Agent *agent)
 		if (!agent->goal.empty())
 			options.goal = agent->goal;
 		agent->handle = platform->start(*agent->player, options);
+		agent->events = agent->handle.on([this, agent, name = agent->name](const wsi::AgentEvent &event) {
+			if (event.type != "subgoal")
+				return;
+			noteSubgoal(name, event);
+			rememberSubgoal(agent, event);
+		});
 		if (agent->stop.load() || closing.load()) {
 			try {
 				agent->handle.stop();
@@ -632,6 +702,44 @@ void WsiService::Impl::doStart(Agent *agent)
 		agent->needs_cleanup = true;
 		errorstream << "WSI " << agent->name << " failed to start: " << e.what() << std::endl;
 	}
+}
+
+void WsiService::Impl::rememberSubgoal(Agent *agent, const wsi::AgentEvent &event)
+{
+	if (event.error && !event.error->empty())
+		return;
+	const std::string action = event.action.value_or("");
+	const wsi::Json args = event.args.value_or(wsi::Json::object());
+	const std::string id = jsonField(args, "id");
+	if (id.empty())
+		return;
+	std::lock_guard lock(agent->subgoal_mu);
+	if (action == "complete_subgoal") {
+		agent->subgoals.erase(std::remove_if(agent->subgoals.begin(), agent->subgoals.end(),
+				[&](const Agent::Subgoal &item) { return item.id == id; }),
+				agent->subgoals.end());
+		return;
+	}
+	Agent::Subgoal *found = nullptr;
+	for (auto &item : agent->subgoals) {
+		if (item.id == id) {
+			found = &item;
+			break;
+		}
+	}
+	if (action == "add_subgoal") {
+		if (!found) {
+			agent->subgoals.push_back(Agent::Subgoal{});
+			found = &agent->subgoals.back();
+			found->id = id;
+		}
+		const std::string objective = jsonField(args, "objective");
+		if (!objective.empty())
+			found->objective = objective;
+		return;
+	}
+	if (action == "update_subgoal" && found)
+		found->progress = jsonField(args, "progress");
 }
 
 void WsiService::Impl::doTurn(Agent *agent)
@@ -805,6 +913,49 @@ int WsiService::Impl::startAgent(lua_State *L)
 	return 1;
 }
 
+void WsiService::Impl::requestTurn(lua_State *L)
+{
+	const int id = luaL_checkinteger(L, 1);
+	std::lock_guard lock(mu);
+	for (auto &agent : agents) {
+		if (agent->id != id || agent->cleaned.load() || agent->stop.load())
+			continue;
+		agent->turns_due.fetch_add(1);
+		cv.notify_all();
+		return;
+	}
+}
+
+int WsiService::Impl::pushSubgoals(lua_State *L)
+{
+	const int id = luaL_checkinteger(L, 1);
+	std::vector<Agent::Subgoal> copy;
+	{
+		std::lock_guard lock(mu);
+		for (auto &agent : agents) {
+			if (agent->id != id || agent->cleaned.load())
+				continue;
+			std::lock_guard goals(agent->subgoal_mu);
+			copy = agent->subgoals;
+			break;
+		}
+	}
+	lua_newtable(L);
+	int index = 1;
+	for (const auto &item : copy) {
+		lua_newtable(L);
+		lua_pushlstring(L, item.id.data(), item.id.size());
+		lua_setfield(L, -2, "id");
+		lua_pushlstring(L, item.objective.data(), item.objective.size());
+		lua_setfield(L, -2, "objective");
+		lua_pushlstring(L, item.progress.data(), item.progress.size());
+		lua_setfield(L, -2, "progress");
+		lua_rawseti(L, -2, index);
+		index++;
+	}
+	return 1;
+}
+
 void WsiService::Impl::stopAgent(lua_State *L)
 {
 	const int id = luaL_checkinteger(L, 1);
@@ -895,6 +1046,16 @@ int WsiService::startAgent(lua_State *L)
 void WsiService::stopAgent(lua_State *L)
 {
 	impl_->stopAgent(L);
+}
+
+void WsiService::requestTurn(lua_State *L)
+{
+	impl_->requestTurn(L);
+}
+
+int WsiService::pushSubgoals(lua_State *L)
+{
+	return impl_->pushSubgoals(L);
 }
 
 #endif

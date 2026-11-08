@@ -1,4 +1,4 @@
-local GOAL = "You act only when a player speaks to you. messages lists what they said. subgoals lists the jobs you added for this session. When they ask for a job that lasts beyond this reply, such as gathering wood or building a house, add a subgoal that states the job in one sentence, then call one game action. For wood, call gather. The objective must say the total number of logs wood_have should reach. Keep that subgoal until wood_have reaches it, or they tell you to stop. A nearby player does not cancel it. When the wood is done or they tell you to stop, complete that subgoal, then call follow, stay, or say. For a house or any other lasting job, call say after adding the subgoal, and do not complete it until the job is done or they tell you to stop. If they asked you to follow and no wood subgoal is active, call follow. If they asked you to explore or wander, call explore. If they asked you to stay or wait, call stay. If they asked you to break some other block, call dig. If they asked you to place a block, call place. Otherwise call say and answer them. You already walk, hop over blocks, and chop trees while a wood subgoal is active. While a house subgoal is active, you place the house yourself from planks in inventory."
+local GOAL = "You act only when a player speaks to you. messages lists what they said. blocks lists the diggable blocks you can see, each with a node name and a description. subgoals lists the jobs you added for this session. say puts one speech bubble over your head. When they ask you to gather something vague, such as blue blocks, and more than one block in blocks fits, call say and ask one short question that names those choices. After they answer, call gather with your best guess of the block. If only one block fits, call gather without asking. gather keeps working while that job is active. For a lasting job, add a subgoal in one sentence, then call one action. For wood, what is wood. Keep a gather subgoal until the count is met or they tell you to stop. A nearby player does not cancel it. When it is done or they tell you to stop, complete that subgoal, then call follow, stay, or say. For a house, call say after adding the subgoal, and do not complete it until the house is done or they tell you to stop. If they ask you to follow, call follow. If they ask you to explore, call explore. If they ask you to stay, call stay. If they ask you to fight with them, protect them, or help them fight, call guard. If they insult you or tell you to fight them, call fight with their name. If they ask you to break one specific block, call dig. If they ask you to place a block, call place. Otherwise call say and answer them. You already walk, hop over one block, gather, and fight while those modes are active."
 local HEAR_LIMIT = 8
 local MAP = 16
 local REACH = MAP
@@ -102,8 +102,7 @@ local function step_open(stand, dx, dz)
 	return ny ~= nil and math.abs(ny - stand.y) <= 1
 end
 
-local function can_jump(stand, dx, dz)
-	local dirx, dirz = cardinal(dx, dz)
+local function one_block_step(stand, dirx, dirz)
 	if dirx == 0 and dirz == 0 then
 		return false
 	end
@@ -112,6 +111,19 @@ local function can_jump(stand, dx, dz)
 	end
 	return body_clear(stand.x, stand.y + 1, stand.z)
 		and body_clear(stand.x + dirx, stand.y + 1, stand.z + dirz)
+end
+
+local function can_jump(stand, dx, dz)
+	local dirx, dirz = cardinal(dx, dz)
+	if one_block_step(stand, dirx, dirz) then
+		return true
+	end
+	if math.abs(dx) < 0.2 or math.abs(dz) < 0.2 then
+		return false
+	end
+	local sx = dx > 0 and 1 or -1
+	local sz = dz > 0 and 1 or -1
+	return one_block_step(stand, sx, 0) or one_block_step(stand, 0, sz)
 end
 
 local MOVE_DIRS = {
@@ -243,17 +255,29 @@ local function behave(self, dtime)
 	local face = nil
 	if mode == "stay" then
 		face = nil
+	elseif mode == "guard" or mode == "fight" then
+		if combat_move(self, dtime, pos, stand) then
+			return
+		end
+		local target, dist = nearest_player(pos)
+		if target and dist > FOLLOW_STOP then
+			hx, hz = steer(self, stand, target.x, target.z)
+			face = vector.new(target.x - pos.x, 0, target.z - pos.z)
+		elseif target then
+			face = vector.new(target.x - pos.x, 0, target.z - pos.z)
+		end
 	elseif mode == "gather" then
-		local need = self._wood_need
-		if need and wood_count(self) >= need then
-			local have = wood_count(self)
+		local have = gather_count(self)
+		local need = self._gather_names and self._gather_need or self._wood_need
+		if need and need > 0 and have >= need then
 			local subgoal = self._wood_subgoal
 			self._mode = "stay"
 			self._wood_done = tostring(subgoal or "") .. "\0" .. (self._wood_objective or "")
+			self._gather_names = nil
 			self._wood_at = nil
 			drive(self, pos, stand, 0, 0)
 			if self._agent and not self._turn_pending then
-				core.log("action", "WSI Villager wood goal complete: " .. have .. " logs, subgoal " .. tostring(subgoal or ""))
+				core.log("action", "WSI Villager gather complete: " .. have .. " " .. tostring(self._gather_label or "logs"))
 				self._turn_pending = true
 				core.wsi_turn(self._agent)
 			end
@@ -263,7 +287,17 @@ local function behave(self, dtime)
 		if self._wood_skip and now >= (self._wood_skip_until or 0) then
 			self._wood_skip = nil
 		end
-		local block = nearest_log(stand, self._wood_skip)
+		local block = nearest_gather_block(stand, self._wood_skip, self._gather_names)
+		if self._gather_names and not block then
+			self._mode = "stay"
+			self._gather_names = nil
+			drive(self, pos, stand, 0, 0)
+			if self._agent and not self._turn_pending then
+				self._turn_pending = true
+				core.wsi_turn(self._agent)
+			end
+			return
+		end
 		if block and close_enough(stand, block) then
 			if now >= (self._chop_after or 0) then
 				self._chop_after = now + 450000
@@ -320,10 +354,24 @@ function drive(self, pos, stand, hx, hz)
 	local vel = self.object:get_velocity() or vector.zero()
 	local vy = vel.y
 	local now = core.get_us_time()
-	if grounded(pos, stand) then
+	local on_ground = grounded(pos, stand)
+	if self._jumping then
+		local cleared = stand.y > (self._jump_from or stand.y) or not on_ground
+		if cleared or now >= (self._jump_until or 0) then
+			self._jumping = nil
+			if on_ground then
+				vy = 0
+			end
+		else
+			vy = JUMP_SPEED
+		end
+	elseif on_ground then
 		if (hx ~= 0 or hz ~= 0) and can_jump(stand, hx, hz) and now >= (self._jump_after or 0) then
 			vy = JUMP_SPEED
-			self._jump_after = now + 700000
+			self._jumping = true
+			self._jump_from = stand.y
+			self._jump_until = now + 350000
+			self._jump_after = now + 500000
 		else
 			vy = 0
 		end
@@ -504,6 +552,265 @@ function nearest_log(stand, skip)
 	return best
 end
 
+local GATHER_SKIP = {
+	block = true,
+	blocks = true,
+	item = true,
+	items = true,
+	some = true,
+	any = true,
+	the = true,
+	["and"] = true,
+	of = true,
+}
+
+local function query_words(query)
+	local words = {}
+	for word in query:lower():gmatch("%w+") do
+		if #word > 1 and not GATHER_SKIP[word] then
+			words[#words + 1] = word
+		end
+	end
+	return words
+end
+
+local function score_match(query, name, description)
+	local blob = (description .. " " .. name):lower()
+	local wanted = query:lower()
+	if blob == wanted or name:lower() == wanted or description:lower() == wanted then
+		return 100
+	end
+	if description:lower():find(wanted, 1, true) or name:lower():find(wanted, 1, true) then
+		return 95
+	end
+	local words = query_words(wanted)
+	if #words == 0 then
+		return 0
+	end
+	local hit = 0
+	for _, word in ipairs(words) do
+		if blob:find(word, 1, true) then
+			hit = hit + 1
+		end
+	end
+	return math.floor(100 * hit / #words)
+end
+
+local function diggable_node(name)
+	if name == "air" or name == "ignore" then
+		return nil
+	end
+	local def = core.registered_nodes[name]
+	if not def or def.diggable == false or core.get_item_group(name, "unbreakable") > 0 then
+		return nil
+	end
+	return def
+end
+
+local function nearby_catalog(stand)
+	local found = {}
+	for dz = -MAP, MAP do
+		for dx = -MAP, MAP do
+			for dy = -8, 12 do
+				local name = core.get_node({x = stand.x + dx, y = stand.y + dy, z = stand.z + dz}).name
+				local def = diggable_node(name)
+				if def then
+					local entry = found[name]
+					local dist = math.abs(dx) + math.abs(dy) + math.abs(dz)
+					if not entry then
+						found[name] = {
+							node = name,
+							description = def.description or name,
+							count = 1,
+							dist = dist,
+						}
+					else
+						entry.count = entry.count + 1
+						if dist < entry.dist then
+							entry.dist = dist
+						end
+					end
+				end
+			end
+		end
+	end
+	local ranked = {}
+	for _, entry in pairs(found) do
+		ranked[#ranked + 1] = entry
+	end
+	table.sort(ranked, function(a, b)
+		if a.dist == b.dist then
+			return a.count > b.count
+		end
+		return a.dist < b.dist
+	end)
+	local listed = {}
+	local limit = math.min(40, #ranked)
+	for i = 1, limit do
+		local entry = ranked[i]
+		listed[i] = {node = entry.node, description = entry.description, count = entry.count}
+	end
+	return listed, found
+end
+
+local function resolve_gather(stand, query)
+	local _, found = nearby_catalog(stand)
+	local ranked = {}
+	for _, entry in pairs(found) do
+		local score = score_match(query, entry.node, entry.description)
+		if score >= 70 then
+			entry.score = score
+			ranked[#ranked + 1] = entry
+		end
+	end
+	table.sort(ranked, function(a, b)
+		if a.score == b.score then
+			return a.dist < b.dist
+		end
+		return a.score > b.score
+	end)
+	if #ranked == 0 then
+		return nil
+	end
+	local choices = {ranked[1]}
+	for i = 2, math.min(4, #ranked) do
+		if ranked[1].score - ranked[i].score <= 20 then
+			choices[#choices + 1] = ranked[i]
+		end
+	end
+	if #choices > 1 then
+		local listed = {}
+		for i, entry in ipairs(choices) do
+			listed[i] = {node = entry.node, description = entry.description, count = entry.count}
+		end
+		return {choices = listed}
+	end
+	return {node = ranked[1].node, description = ranked[1].description}
+end
+
+function nearest_gather_block(stand, skip, names)
+	if not names then
+		return nearest_log(stand, skip)
+	end
+	local best = nil
+	local best_dist = nil
+	for dz = -MAP, MAP do
+		for dx = -MAP, MAP do
+			for dy = -8, 12 do
+				local pos = {x = stand.x + dx, y = stand.y + dy, z = stand.z + dz}
+				if names[core.get_node(pos).name]
+					and not (skip and skip.x == pos.x and skip.y == pos.y and skip.z == pos.z) then
+					local dist = (dx * dx + dz * dz) * 1000 + (dy + 8)
+					if not best_dist or dist < best_dist then
+						best = pos
+						best_dist = dist
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+function gather_count(self)
+	if not self._gather_drops then
+		return wood_count(self)
+	end
+	local inv = self._inv
+	if not inv then
+		return 0
+	end
+	local count = 0
+	for slot = 1, INV_SLOTS do
+		local stack = inv:get_stack("main", slot)
+		if not stack:is_empty() and self._gather_drops[stack:get_name()] then
+			count = count + stack:get_count()
+		end
+	end
+	return count
+end
+
+local function hostile_near(pos)
+	local best = nil
+	local best_pos = nil
+	local best_dist = nil
+	for _, obj in ipairs(core.get_objects_inside_radius(pos, 16)) do
+		local ent = obj:get_luaentity()
+		if ent and ent.type == "monster" and ent.name ~= "wsi_npc:villager" and obj:get_hp() > 0 then
+			local obj_pos = obj:get_pos()
+			if obj_pos then
+				local dist = flat_distance(pos, obj_pos)
+				if not best_dist or dist < best_dist then
+					best = obj
+					best_pos = obj_pos
+					best_dist = dist
+				end
+			end
+		end
+	end
+	return best, best_pos
+end
+
+local function living_foe(self, pos)
+	if self._foe_name then
+		local player = core.get_player_by_name(self._foe_name)
+		if player and player:get_hp() > 0 then
+			local player_pos = player:get_pos()
+			if player_pos and flat_distance(pos, player_pos) <= 28 then
+				return player, player_pos
+			end
+		end
+		self._foe_name = nil
+	end
+	local foe = self._foe_obj
+	if foe and foe:is_valid() and foe:get_hp() > 0 then
+		local foe_pos = foe:get_pos()
+		if foe_pos and flat_distance(pos, foe_pos) <= 28 then
+			return foe, foe_pos
+		end
+	end
+	self._foe_obj = nil
+	if self._mode == "guard" then
+		local mob, mob_pos = hostile_near(pos)
+		if mob then
+			self._foe_obj = mob
+			return mob, mob_pos
+		end
+	end
+	return nil
+end
+
+function combat_move(self, _dtime, pos, stand)
+	local target, target_pos = living_foe(self, pos)
+	if not target or not target_pos then
+		if self._mode == "fight" then
+			self._mode = "follow"
+		end
+		return false
+	end
+	local dx = target_pos.x - pos.x
+	local dz = target_pos.z - pos.z
+	local dist = math.sqrt(dx * dx + dz * dz)
+	if dist < 2.2 and math.abs(target_pos.y - pos.y) < 4 then
+		local now = core.get_us_time()
+		if now >= (self._swing_after or 0) then
+			self._swing_after = now + 900000
+			target:punch(self.object, 1, {
+				full_punch_interval = 0.9,
+				damage_groups = {fleshy = 2},
+			}, vector.new(dx, target_pos.y - pos.y, dz))
+		end
+		drive(self, pos, stand, 0, 0)
+		if dx ~= 0 or dz ~= 0 then
+			self.object:set_yaw(core.dir_to_yaw(vector.new(dx, 0, dz)))
+		end
+		return true
+	end
+	local hx, hz = steer(self, stand, target_pos.x, target_pos.z)
+	drive(self, pos, stand, hx, hz)
+	return true
+end
+
 local function advance_task(self)
 	local task = self._task
 	local pos = self.object:get_pos()
@@ -556,6 +863,23 @@ local function see(self)
 	self._turn_pending = false
 	local messages = self._heard or {}
 	self._heard = {}
+	local stand = stand_node(pos)
+	local blocks = nearby_catalog(stand)
+	local hostiles = {}
+	for _, obj in ipairs(core.get_objects_inside_radius(pos, 16)) do
+		local ent = obj:get_luaentity()
+		if ent and ent.type == "monster" and obj:get_hp() > 0 then
+			local mob_pos = obj:get_pos()
+			if mob_pos then
+				hostiles[#hostiles + 1] = {
+					name = ent.name,
+					x = mob_pos.x,
+					y = mob_pos.y,
+					z = mob_pos.z,
+				}
+			end
+		end
+	end
 	return {
 		x = pos.x,
 		y = pos.y,
@@ -565,11 +889,65 @@ local function see(self)
 		players = players,
 		messages = messages,
 		inventory = inventory_view(self),
-		wood = visible_wood(stand_node(pos)),
+		blocks = blocks,
+		hostiles = hostiles,
+		wood = visible_wood(stand),
 		wood_have = wood_count(self),
 		wood_need = self._wood_need,
+		gather_have = gather_count(self),
+		gather_what = self._gather_label,
 		subgoals = self._agent and core.wsi_subgoals(self._agent) or {},
 	}
+end
+
+local function wrap_speech(text)
+	if #text <= 36 then
+		return text
+	end
+	local lines = {}
+	local line = ""
+	for word in text:gmatch("%S+") do
+		if line == "" then
+			line = word
+		elseif #line + 1 + #word > 36 then
+			lines[#lines + 1] = line
+			line = word
+		else
+			line = line .. " " .. word
+		end
+	end
+	if line ~= "" then
+		lines[#lines + 1] = line
+	end
+	return table.concat(lines, "\n")
+end
+
+function show_speech(self, text)
+	local bubble = self._bubble
+	if bubble and not bubble:is_valid() then
+		bubble = nil
+	end
+	if not bubble then
+		local pos = self.object:get_pos()
+		if not pos then
+			return
+		end
+		bubble = core.add_entity(pos, "wsi_npc:bubble")
+		if not bubble then
+			return
+		end
+		bubble:set_attach(self.object, "", {x = 0, y = 12, z = 0}, {x = 0, y = 0, z = 0})
+		self._bubble = bubble
+	end
+	bubble:set_properties({
+		nametag = wrap_speech(text),
+		nametag_color = "#1c140c",
+		nametag_bgcolor = "#fff6d8",
+	})
+	local ent = bubble:get_luaentity()
+	if ent then
+		ent._left = 5
+	end
 end
 
 local function say(self, text)
@@ -579,6 +957,7 @@ local function say(self, text)
 	if #text > 160 then
 		error("message is too long")
 	end
+	show_speech(self, text)
 	core.chat_send_all("<Villager> " .. text)
 	return {ok = true}
 end
@@ -588,6 +967,16 @@ local function set_mode(self, mode, wood_need)
 	self._wander = nil
 	self._task = nil
 	self._wood_at = nil
+	if mode ~= "fight" and mode ~= "guard" then
+		self._foe_name = nil
+		self._foe_obj = nil
+	end
+	if mode ~= "gather" then
+		self._gather_names = nil
+		self._gather_drops = nil
+		self._gather_need = nil
+		self._gather_label = nil
+	end
 	if mode == "gather" then
 		if wood_need then
 			self._wood_need = wood_need
@@ -887,7 +1276,49 @@ local function travel_and_break(self, pos)
 end
 
 local function gather_wood(self, wood_need)
+	self._gather_names = nil
+	self._gather_drops = nil
+	self._gather_label = "wood"
+	self._gather_need = nil
 	return set_mode(self, "gather", wood_need)
+end
+
+local function begin_gather(self, what, count)
+	if type(what) ~= "string" or what == "" then
+		error("what is required")
+	end
+	if type(count) ~= "number" then
+		count = 0
+	end
+	local lowered = what:lower()
+	if lowered == "wood" or lowered == "log" or lowered == "logs" or lowered == "tree" or lowered == "trees" then
+		return gather_wood(self, count > 0 and count or nil)
+	end
+	local pos = self.object:get_pos()
+	if not pos then
+		error("villager is gone")
+	end
+	local resolved = resolve_gather(stand_node(pos), what)
+	if not resolved then
+		return {found = false, what = what}
+	end
+	if resolved.choices then
+		return {choices = resolved.choices}
+	end
+	local drops = {[resolved.node] = true}
+	for _, drop in ipairs(core.get_node_drops(resolved.node, "")) do
+		local stack = ItemStack(drop)
+		if not stack:is_empty() then
+			drops[stack:get_name()] = true
+		end
+	end
+	set_mode(self, "gather")
+	self._gather_names = {[resolved.node] = true}
+	self._gather_drops = drops
+	self._gather_need = count > 0 and count or nil
+	self._gather_label = resolved.description
+	self._wood_need = nil
+	return {mode = "gather", node = resolved.node, what = resolved.description, need = count}
 end
 
 local function dig_block(self, dx, dy, dz)
@@ -1158,7 +1589,7 @@ local function start_agent(self)
 		actions = {
 			{
 				name = "say",
-				description = "Speak one short line in chat. Use this to answer a player.",
+				description = "Speak one short line. It appears in a bubble over your head. Use this to answer a player, and to ask which block they mean when gather returns choices.",
 				params = {
 					{name = "text", type = "string"},
 				},
@@ -1192,10 +1623,38 @@ local function start_agent(self)
 			},
 			{
 				name = "gather",
-				description = "Walk to logs and break them. Call this after adding a subgoal to collect wood. The chopping continues while that subgoal is active.",
+				description = "Walk to a kind of block and pick it up. what is a node name or words from its description, such as wood or blue wool. count is how many to stop at. Use 0 to continue until no more are nearby. If several blocks fit, this returns choices and you must ask which one with say. If it returns found false, say you do not see any.",
+				params = {
+					{name = "what", type = "string"},
+					{name = "count", type = "integer"},
+				},
+				run = function(what, count)
+					return begin_gather(self, what, count)
+				end,
+			},
+			{
+				name = "guard",
+				description = "Fight hostile mobs alongside the nearest player. Follow them and attack monsters nearby. Call this when they ask you to fight with them, protect them, or help them in a fight.",
 				params = {},
 				run = function()
-					return gather_wood(self)
+					self._foe_name = nil
+					self._foe_obj = nil
+					return set_mode(self, "guard")
+				end,
+			},
+			{
+				name = "fight",
+				description = "Fight a player who attacked or taunted you. name is that player's name.",
+				params = {
+					{name = "name", type = "string"},
+				},
+				run = function(name)
+					if type(name) ~= "string" or name == "" then
+						error("name is required")
+					end
+					self._foe_name = name
+					self._foe_obj = nil
+					return set_mode(self, "fight")
 				end,
 			},
 			{
@@ -1233,6 +1692,29 @@ local function start_agent(self)
 	self._agent = id
 end
 
+core.register_entity("wsi_npc:bubble", {
+	initial_properties = {
+		visual = "sprite",
+		textures = {"blank.png"},
+		visual_size = {x = 0.01, y = 0.01},
+		physical = false,
+		pointable = false,
+		collide_with_objects = false,
+		static_save = false,
+		nametag = "",
+		nametag_color = "#1c140c",
+		nametag_bgcolor = "#fff6d8",
+	},
+
+	on_step = function(self, dtime)
+		self._left = (self._left or 5) - dtime
+		local parent = self.object:get_attach()
+		if self._left <= 0 or not parent then
+			self.object:remove()
+		end
+	end,
+})
+
 core.register_entity("wsi_npc:villager", {
 	initial_properties = {
 		visual = "mesh",
@@ -1243,7 +1725,7 @@ core.register_entity("wsi_npc:villager", {
 		selectionbox = {-0.25, 0.0, -0.25, 0.25, 1.90, 0.25},
 		physical = true,
 		collide_with_objects = true,
-		stepheight = 0.6,
+		stepheight = 1.1,
 		nametag = "Villager",
 		nametag_color = "#FFFFFF",
 	},
@@ -1282,6 +1764,11 @@ core.register_entity("wsi_npc:villager", {
 	end,
 
 	on_deactivate = function(self)
+		local bubble = self._bubble
+		self._bubble = nil
+		if bubble and bubble:is_valid() then
+			bubble:remove()
+		end
 		local id = self._agent
 		self._agent = nil
 		if id then
@@ -1308,9 +1795,25 @@ core.register_entity("wsi_npc:villager", {
 		end
 	end,
 
-	on_punch = function(self, _puncher, time_from_last_punch)
+	on_punch = function(self, puncher, time_from_last_punch)
 		if time_from_last_punch < 0.45 then
 			return
+		end
+		if puncher and puncher:is_valid() then
+			self._task = nil
+			self._wander = nil
+			self._mode = "fight"
+			if puncher:is_player() then
+				self._foe_name = puncher:get_player_name()
+				self._foe_obj = nil
+				show_speech(self, "Hey! You want a fight?")
+			else
+				local ent = puncher:get_luaentity()
+				if ent and ent.type == "monster" then
+					self._foe_obj = puncher
+					self._foe_name = nil
+				end
+			end
 		end
 		self._hp = self._hp - 4
 		if self._hp <= 0 then
@@ -1419,6 +1922,9 @@ function apply_subgoals(self)
 	if not self._agent then
 		return
 	end
+	if self._mode == "fight" or self._mode == "guard" then
+		return
+	end
 	local goals = core.wsi_subgoals(self._agent)
 	local wood, need = wood_subgoal(goals)
 	local house = house_subgoal(goals)
@@ -1431,8 +1937,12 @@ function apply_subgoals(self)
 			if need then
 				self._wood_need = need
 			end
-			if self._mode ~= "gather" then
+			if self._mode ~= "gather" or self._gather_names then
 				self._mode = "gather"
+				self._gather_names = nil
+				self._gather_drops = nil
+				self._gather_label = nil
+				self._gather_need = nil
 				self._wander = nil
 				self._task = nil
 				self._wood_at = nil
@@ -1476,6 +1986,21 @@ function apply_subgoals(self)
 	end
 end
 
+local function is_taunt(text)
+	local lower = text:lower()
+	local phrases = {
+		"fight me", "attack me", "come at me", "fight you",
+		"coward", "idiot", "stupid", "loser", "weakling",
+		"i hate you", "shut up", "kill you",
+	}
+	for _, phrase in ipairs(phrases) do
+		if lower:find(phrase, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 core.register_on_chat_message(function(name, message)
 	if message == "" or message:sub(1, 1) == "/" then
 		return
@@ -1483,6 +2008,7 @@ core.register_on_chat_message(function(name, message)
 	if #message > 160 then
 		message = message:sub(1, 160)
 	end
+	local taunt = is_taunt(message)
 	local player = core.get_player_by_name(name)
 	local player_pos = player and player:get_pos()
 	if not player_pos then
@@ -1492,6 +2018,13 @@ core.register_on_chat_message(function(name, message)
 		if ent.name == "wsi_npc:villager" and ent.object and ent._agent then
 			local pos = ent.object:get_pos()
 			if pos and flat_distance(pos, player_pos) <= HEAR_RANGE then
+				if taunt then
+					ent._mode = "fight"
+					ent._foe_name = name
+					ent._foe_obj = nil
+					ent._task = nil
+					ent._wander = nil
+				end
 				local heard = ent._heard
 				if not heard then
 					heard = {}
